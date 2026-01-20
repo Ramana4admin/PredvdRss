@@ -1,10 +1,12 @@
-import cloudscraper
-from bs4 import BeautifulSoup
-from datetime import datetime
-from xml.etree.ElementTree import Element, SubElement, ElementTree
-import time, json, os
-from urllib.parse import parse_qs, urlparse
+import os
+import json
+import time
 import re
+from datetime import datetime
+from urllib.parse import parse_qs, urlparse
+from xml.etree.ElementTree import Element, SubElement, ElementTree
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 ================= CONFIG =================
 
@@ -14,105 +16,80 @@ BASE_URLS = [
     "https://www.1tamilmv.do/",
     "https://www.1tamilmv.re/",
     "https://www.1tamilmv.band/",
+    "https://www.1tamilmv.kiwi/",  # Add recent mirrors if needed
 ]
 
 OUT_FILE = "tamilmv_predvd.xml"
 STATE_FILE = "state_predvd.json"
 
-MAX_SIZE_GB = 4              # Skip >4GB
-TOPIC_LIMIT = 15             # Latest PreDVD topics only (increased a bit since filtered)
-TOPIC_DELAY = 6              # Seconds between topic fetch
-MAX_MAGNETS_PER_RUN = 12     # Flood control, reduced to be safe
+MAX_SIZE_GB = 4
+TOPIC_LIMIT = 20             # Homepage లో recent ఎక్కువ ఉంటాయి
+TOPIC_DELAY = 8
+MAX_MAGNETS_PER_RUN = 10
 
-PREDVD_FORUM_PATH = "index.php?/forums/forum/10-predvd-dvdscr-cam-tc/"  # Main one from .haus
-# Fallback paths if needed
-FORUM_PATHS = [
-    "index.php?/forums/forum/10-predvd-dvdscr-cam-tc/",
-    "index.php?/forums/forum/35-predvd-dvdscr-cam-tc/",
-]
-
-# Keywords to filter PreDVD/DVD only
-PREDVD_KEYWORDS = re.compile(r'(predvd|dvdscr|dvd|cam|tc|hqp predvd|predvd hq clean)', re.IGNORECASE)
+PREDVD_KEYWORDS = re.compile(r'(predvd|hq predvd|dvdscr|dvd scr|dvd|cam|tc|hdcam|hq clean|predvd hq|dvdscreener)', re.IGNORECASE)
 
 ==========================================
 
-scraper = cloudscraper.create_scraper(
-    browser={"browser": "chrome", "platform": "windows", "mobile": False}
-)
-
 # Load state
+processed = set()
 if os.path.exists(STATE_FILE):
     with open(STATE_FILE) as f:
         state = json.load(f)
-else:
-    state = {"magnets": []}
+        processed = set(state.get("magnets", []))
 
-processed = set(state.get("magnets", []))
+def get_page_content(url, timeout=60000):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+        page = browser.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        try:
+            page.goto(url, timeout=timeout, wait_until="networkidle")
+            page.wait_for_timeout(5000)  # Extra wait for CF
+            content = page.content()
+        except Exception as e:
+            print(f"Playwright error on {url}: {e}")
+            content = ""
+        finally:
+            browser.close()
+    return content
 
-# Resolve working domain
+# Resolve BASE_URL
 BASE_URL = None
 for url in BASE_URLS:
-    try:
-        r = scraper.get(url, timeout=20)
-        if r.status_code == 200 and "PreDVD" in r.text:  # rough check for content
-            BASE_URL = url
-            break
-    except:
-        continue
+    content = get_page_content(url)
+    if content and len(content) > 5000 and "PreDVD" in content:  # Rough check
+        BASE_URL = url
+        break
 
 if not BASE_URL:
-    print("❌ No working domain found")
+    print("❌ No working domain (all blocked or no PreDVD content)")
     exit()
 
 print("✅ Using:", BASE_URL)
 
-# Try to find exact PreDVD forum URL
-PREDVD_FORUM_URL = None
-for path in FORUM_PATHS:
-    test_url = BASE_URL.rstrip('/') + '/' + path.lstrip('/')
-    try:
-        r = scraper.get(test_url, timeout=15)
-        if r.status_code == 200:
-            PREDVD_FORUM_URL = test_url
-            break
-    except:
-        pass
-
-if not PREDVD_FORUM_URL:
-    # Fallback to homepage and filter later
-    PREDVD_FORUM_URL = BASE_URL
-    print("⚠️ Using homepage fallback - will filter by title keywords")
-
-print("PreDVD Forum URL:", PREDVD_FORUM_URL)
-
 # RSS setup
 rss = Element("rss", version="2.0")
 channel = SubElement(rss, "channel")
-
 SubElement(channel, "title").text = "1TamilMV PreDVD/DVD RSS (≤4GB)"
 SubElement(channel, "link").text = BASE_URL
-SubElement(channel, "description").text = "Auto RSS for PreDVD, DVDScr, CAM, TC only (Below 4GB)"
-SubElement(channel, "lastBuildDate").text = datetime.utcnow().strftime(
-    "%a, %d %b %Y %H:%M:%S GMT"
-)
+SubElement(channel, "description").text = "Auto RSS for PreDVD, HQ PreDVD etc. only (Below 4GB)"
+SubElement(channel, "lastBuildDate").text = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
 
-# Fetch PreDVD section or homepage
-home = scraper.get(PREDVD_FORUM_URL, timeout=30)
-soup = BeautifulSoup(home.text, "lxml")
+# Fetch homepage (no forum path needed now)
+home_content = get_page_content(BASE_URL)
+soup = BeautifulSoup(home_content, "lxml")
 
 posts = []
-for a in soup.select("a[href*='forums/topic']"):
-    title = a.get_text(strip=True)
+for a in soup.find_all("a", href=True):
     href = a["href"]
-    # Skip pinned
-    if "pinned" in a.get("class", []):
+    title = a.get_text(strip=True)
+    if not title:
         continue
-    # Filter only PreDVD/DVD related titles
-    if PREDVD_KEYWORDS.search(title):
+    if "topic" in href.lower() and PREDVD_KEYWORDS.search(title):
         posts.append((title, href))
 
 posts = posts[:TOPIC_LIMIT]
-print(f"Found {len(posts)} potential PreDVD topics")
+print(f"Found {len(posts)} potential PreDVD topics from homepage")
 
 def magnet_size_gb(magnet):
     qs = parse_qs(urlparse(magnet).query)
@@ -120,22 +97,21 @@ def magnet_size_gb(magnet):
         return int(qs["xl"][0]) / (1024 ** 3)
     return None
 
-# Scrape topics
 added_count = 0
 new_data = False
 
-for title, post_url in posts:
+for title, post_rel_url in posts:
     if added_count >= MAX_MAGNETS_PER_RUN:
-        print("🚑 Flood limit reached")
         break
 
-    full_post_url = post_url if post_url.startswith('http') else BASE_URL.rstrip('/') + '/' + post_url.lstrip('/')
+    full_post_url = post_rel_url if post_rel_url.startswith('http') else BASE_URL.rstrip('/') + '/' + post_rel_url.lstrip('/')
     
     try:
         time.sleep(TOPIC_DELAY)
-        page = scraper.get(full_post_url, timeout=30)
-        psoup = BeautifulSoup(page.text, "lxml")
+        page_content = get_page_content(full_post_url)
+        psoup = BeautifulSoup(page_content, "lxml")
 
+        magnets_found = False
         for a in psoup.find_all("a", href=True):
             magnet = a["href"]
             if not magnet.startswith("magnet:?"):
@@ -147,39 +123,38 @@ for title, post_url in posts:
             if size and size > MAX_SIZE_GB:
                 continue
 
-            # Double-check title has PreDVD keyword (safety)
             if not PREDVD_KEYWORDS.search(title):
                 continue
 
             item = SubElement(channel, "item")
-            SubElement(item, "title").text = (
-                f"{title} [{round(size,2)}GB]" if size else title
-            )
+            size_str = f" [{round(size,2)}GB]" if size else ""
+            SubElement(item, "title").text = title + size_str
             SubElement(item, "link").text = magnet
             SubElement(item, "guid").text = magnet
-            SubElement(item, "pubDate").text = datetime.utcnow().strftime(
-                "%a, %d %b %Y %H:%M:%S GMT"
-            )
+            SubElement(item, "pubDate").text = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
 
             processed.add(magnet)
             added_count += 1
             new_data = True
-            print("➕ Added PreDVD:", title, size or "size unknown")
+            print("➕ Added:", title, size or "unknown size")
+            magnets_found = True
 
             if added_count >= MAX_MAGNETS_PER_RUN:
                 break
 
+        if not magnets_found:
+            print("No magnets in:", title)
+
     except Exception as e:
         print("ERROR on topic:", title, e)
 
-# Save RSS if new
 if new_data:
     ElementTree(rss).write(OUT_FILE, encoding="utf-8", xml_declaration=True)
     print("✅ RSS UPDATED with PreDVD only")
 else:
-    print("ℹ️ No new PreDVD torrents")
+    print("ℹ️ No new PreDVD torrents/magnets found")
 
 with open(STATE_FILE, "w") as f:
     json.dump({"magnets": list(processed)}, f, indent=2)
 
-print("DONE bro! RSS file:", OUT_FILE)
+print("DONE!")
